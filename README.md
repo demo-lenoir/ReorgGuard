@@ -1,135 +1,74 @@
 # ReorgGuard
 
-**Reorg-safe, restart-safe EVM event indexing in Go.**
+ReorgGuard keeps an application database in step with events on an EVM chain.
 
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+Reading logs once is not enough: providers can limit or omit a range, a WebSocket connection can drop, a process can die, and a chain can replace blocks that were already indexed. ReorgGuard fetches filtered logs, proves block ancestry, and updates a durable PostgreSQL canonical view. This repository demonstrates how an indexer can recover without silently skipping events or presenting two competing histories as one.
 
-ReorgGuard turns filtered EVM logs into a durable PostgreSQL canonical view. It is a production-style reference implementation for the failure modes hidden behind `eth_getLogs`: provider limits, duplicate delivery, missed WebSocket notifications, chain reorganizations, process death, and RPC failover.
-
-The implementation combines adaptive historical backfill, parent-linked canonical tracking, bounded common-ancestor recovery, atomic branch switching, durable checkpoints, WebSocket hints with HTTP gap recovery, guarded multi-RPC failover, ordered concurrent fetch, an operational API, Prometheus metrics, OpenTelemetry traces, and correctness-gated benchmarks. The [implementation contract](SPEC.md) defines the invariants, and the [evidence ledger](docs/evidence.md) connects each claim to tests and artifacts.
-
-## Try the full failure story
-
-```sh
-make demo
-```
-
-The deterministic local demo starts PostgreSQL, Anvil, transport fault proxies, and the real ReorgGuard binary. It proves:
-
-`backfill → live event → WS loss → HTTP gap catch-up → A→B→A reorg → SIGKILL/restart → RPC failover → API/metrics → SQL checksum`
-
-The demo deploys a tiny event emitter only to local Anvil and removes its processes and containers on exit. See the [step-by-step demo](docs/demo.md).
-
-## Architecture
+## Data flow
 
 ```mermaid
 flowchart LR
-  subgraph RPC[Configured EVM RPC providers]
-    HTTP[HTTP: blocks and logs]
-    WS[WebSocket: hints only]
-  end
-
-  WS --> Wake[Coalesced sync trigger]
-  HTTP --> Pool[Guarded provider selection]
-  Wake --> Pool
-  Poll[Periodic HTTP polling] --> Pool
-  Pool --> Fetch[Adaptive bounded fetch]
-  Fetch --> Validate[Header, parent and log validation]
-  Validate --> Canon[Canonicalizer and reorg proof]
-  Canon --> Commit[Single ordered transaction path]
-  Commit --> DB[(PostgreSQL)]
-  DB --> State[Durable checkpoint and canonical view]
-  State --> API[API, metrics and tracing]
+  WS[WebSocket hints] --> T[Sync trigger]
+  Poll[HTTP polling] --> T
+  T --> RPC[Guarded RPC provider]
+  RPC --> F[Adaptive log and header fetch]
+  F --> V[Validation and ancestry check]
+  V --> C[Ordered canonical transaction]
+  C --> DB[(PostgreSQL checkpoint and observations)]
+  DB --> API[Status, logs, health and metrics API]
 ```
 
-WebSocket events can wake synchronization but cannot write canonical state. HTTP closes gaps from the durable PostgreSQL checkpoint. Initial backfill, polling, reconnect recovery, and reorg handling all converge through the same validator and ordered store path. Fetch may run concurrently; commits remain contiguous, so a later range cannot move the checkpoint past an incomplete earlier range.
+WebSocket notifications only wake the sync loop. HTTP backfill closes gaps from the last committed checkpoint. Fetching can run concurrently, but validated ranges commit in order; a later range cannot advance the checkpoint past an incomplete earlier one. A reorg marks the old branch non-canonical and atomically projects the replacement, retaining the observations for audit and possible A→B→A recovery.
 
-See [architecture](docs/architecture.md), [canonicality ADRs](docs/adr/), and the [threat model](docs/threat-model.md).
+## Engineering focus
 
-## What happens when things fail?
-
-| Failure | ReorgGuard behavior |
+| Problem | Design and resulting behavior |
 | --- | --- |
-| WebSocket disconnects | HTTP polling continues; reconnect starts catch-up from the durable checkpoint. |
-| Primary RPC fails or rate-limits | A fallback is checked for chain identity, checkpoint compatibility, head freshness, and required methods before use. |
-| Shallow reorg | Parent hashes prove a common ancestor; the old suffix is orphaned and the replacement branch is replayed atomically. |
-| Reorg exceeds the configured depth or cannot be proven | Canonical progress stops and readiness becomes unhealthy. |
-| Process receives SIGKILL | Restart revalidates PostgreSQL and resumes from the last committed checkpoint. |
-| PostgreSQL is unavailable | Work fails within bounded deadlines; no in-memory assumption advances durable progress. |
-| Duplicate block or log delivery | Exact repeats are idempotent; conflicting immutable identity is rejected. |
-| RPC returns a log outside the configured filter | Local validation rejects the complete response and the checkpoint does not move. |
+| A provider caps `eth_getLogs` ranges. | Adaptive bounded backfill splits ranges and validates their headers and logs; progress is recorded only for complete ranges. |
+| WebSocket delivery is not durable. | Notifications are hints, while HTTP catch-up reads from PostgreSQL's checkpoint; disconnects and restarts do not create a permanent gap. |
+| Blocks can be replaced. | Parent hashes prove a bounded common ancestor and one database transaction switches canonical flags, logs, summary, and checkpoint together. |
+| A process may stop during a write. | The transaction either commits the contiguous branch or leaves the previous state intact; restart resumes from durable state. |
+| A fallback RPC may serve the wrong history. | Chain identity, anchor, checkpoint, completed filtered logs, freshness, and method support are checked before failover. |
+| A reorg can invalidate an API page. | Keyset cursors include the canonical revision; an outdated cursor receives HTTP 409 rather than a mixed result. |
 
-The complete mapping from failure to permanent regression is in the [failure matrix](docs/failure-matrix.md). Operational recovery steps are in the [runbook](docs/runbook.md).
+The [failure matrix](docs/failure-matrix.md) and [architecture](docs/architecture.md) describe the precise behavior. Automatic recovery stops when ancestry cannot be proved within the configured bound.
 
-## Reorg correctness
+## Quick start
 
-ReorgGuard retains every observed branch by immutable block and log identity. When branch A is replaced by B, A becomes non-canonical rather than being deleted. If the exact A branch later returns, it can be canonical again without a primary-key collision or duplicate log. The A→B→A path is covered by transaction, restart, live-disconnect, and local Anvil tests.
-
-Canonical flags, replacement data, log visibility, the reorg summary, and the checkpoint change in one PostgreSQL transaction. A failed transaction leaves the previous branch intact. Common ancestry is proven through block hashes and parent hashes; block number alone is never accepted as ancestry.
-
-## Guarded multi-RPC availability
-
-Multiple endpoints improve availability; they are not treated as blockchain consensus. Before failover, ReorgGuard validates the expected chain ID, genesis or configured anchor, the durable checkpoint block and completed filtered log set, provider head, and required RPC methods. Wrong-chain and history-incompatible endpoints are rejected. A provider presenting a plausible new fork still goes through the same bounded reorg engine.
-
-This policy cannot establish global chain truth or detect a plausible omission from `eth_getLogs`. Choosing trustworthy providers remains an operator responsibility. See [ADR-0008](docs/adr/0008-rpc-eligibility-and-failover.md).
-
-## Operational API and observability
-
-The loopback read API is specified in [OpenAPI](api/openapi.yaml):
-
-| Route | Purpose |
-| --- | --- |
-| `GET /v1/status` | Durable and remote heads, lag, checkpoint age, last reorg, provider and WebSocket state |
-| `GET /v1/logs` | Canonical-only log pages with bounded filters and stable ordering |
-| `GET /health/live` | Process liveness independent of dependencies |
-| `GET /health/ready` | Database, safe HTTP progress, fork state, and lag policy |
-| `GET /metrics` | Prometheus exposition with bounded-cardinality labels |
-
-Log pages use keyset pagination and carry the canonical revision. A reorg invalidates an old cursor with HTTP 409 rather than mixing results from two canonical projections. Structured logs redact provider URLs, and optional OpenTelemetry spans cover RPC reads, validation, canonical transactions, and checkpoint updates. See the [observability reference](docs/observability.md).
-
-## Correctness-gated benchmark
-
-The deterministic benchmark indexes 1,024 blocks against a local HTTP fixture and PostgreSQL 18.6. Every run checks the checkpoint, canonical row counts, parent continuity, duplicate suppression and projection checksum before it reports throughput. Run `make benchmark` to generate local raw results under `docs/benchmarks/raw.json`, then validate them with `python3 scripts/validate-benchmark.py docs/benchmarks/raw.json`. The [methodology](docs/benchmarks/README.md) describes the workload and limits. Results belong to the machine and source commit that produced them; they are not a production SLA.
-
-## Run and verify
-
-Prerequisites: Go **1.27.1**, Docker, Foundry **1.8.4** (`anvil`, `forge`, `cast`), Python 3, PostgreSQL `psql`, `rg`, and `make`. The complete release gate also uses govulncheck **1.8.0**, actionlint **1.7.12**, Trivy **0.75.0**, and Syft **1.54.0**.
+Install Go 1.27.1, Docker, Foundry (`anvil`, `forge`, `cast`), Python 3, PostgreSQL command-line tools, `rg`, and `make`. The first run downloads public modules and local test tools. No private chain credentials are required.
 
 ```sh
-make demo              # deterministic end-to-end failure demonstration
-make benchmark-smoke   # short benchmark plus correctness gate
-make verify            # full local gate, including a clean-clone replay
-make benchmark         # regenerate the optional 11-run measured workload
+git clone <repository-url> FinalReorgGuard
+cd FinalReorgGuard
+go mod download
+make demo
+go test ./...
 ```
 
-The first run downloads public Go modules, tool binaries, scanner databases, Solidity compiler, and container images. No private RPC credentials are needed. Safe configuration names are documented in [.env.example](.env.example); the service accepts configuration through the environment. The default mode performs one HTTP catch-up and exits. `REORGGUARD_SYNC_MODE=live` enables continuous polling and optional WebSocket hints.
+The demo starts disposable PostgreSQL, Anvil, fault proxies, and the real service. It checks backfill, live delivery, WebSocket loss, HTTP gap recovery, A→B→A reorganization, forced restart, RPC failover, API output, and a SQL checksum. See the [demo guide](docs/demo.md). To run the service outside the fixture, start from [.env.example](.env.example) and the [runbook](docs/runbook.md); the default mode performs one HTTP catch-up and exits, while `REORGGUARD_SYNC_MODE=live` enables continuous polling.
 
-The multi-stage [Dockerfile](Dockerfile) produces a static `scratch` image, runs as numeric UID/GID 65532, and supports a read-only root filesystem. The operational API binds to loopback inside the container, so container deployments need a same-network-namespace client or an explicitly configured trusted proxy.
+For the full local gate, install govulncheck, actionlint, Trivy, and Syft as listed in [test evidence](docs/evidence.md), then run `make verify`. It runs Go tests and race checks, PostgreSQL integration, the Anvil failure demo, build and scan checks, and a clean-clone replay. `make benchmark-smoke` gives a shorter correctness-gated measurement.
 
-## Engineering evidence
+## Local benchmark
 
-| Area | Evidence |
-| --- | --- |
-| Correctness and verification | [Evidence ledger](docs/evidence.md) |
-| Failure behavior | [Failure matrix](docs/failure-matrix.md) |
-| Architecture and transaction boundaries | [Architecture](docs/architecture.md) |
-| Trust boundaries | [Threat model](docs/threat-model.md) |
-| Operational recovery | [Runbook](docs/runbook.md) |
-| Design decisions | [Architecture decision records](docs/adr/) |
-| API contract | [OpenAPI 3.0](api/openapi.yaml) |
-| Benchmark method | [Benchmark report](docs/benchmarks/README.md); `make benchmark` generates local raw evidence |
-| Supply-chain inspection | `make verify` generates and checks a local SPDX SBOM and unsigned build metadata |
+`make benchmark` indexes 1,024 fixture blocks into local PostgreSQL. Each of its 11 runs checks canonical counts, parent continuity, duplicate suppression, checkpoint, and a projection checksum before reporting a measurement. Raw output is generated at `docs/benchmarks/raw.json`; the [methodology](docs/benchmarks/README.md) states the environment and limits. No result here is a production capacity claim.
 
-## Security and limitations
+## Repository map
 
-- RPC providers remain trusted data sources. Multiple providers do not form consensus.
-- Plausible omitted `eth_getLogs` entries cannot be detected cryptographically by this indexer alone.
-- Automatic reorg recovery is bounded by configured depth and retained local ancestry.
-- The API is a loopback operational surface; public exposure requires an appropriate network and authentication policy.
-- Benchmark results are local evidence, not a production capacity claim or SLA.
-- Local provenance metadata is unsigned and is not a signed public attestation.
-- The project has no production operating history and has not received a professional security audit.
+```text
+cmd/             service and demo proxy entry points
+internal/        fetch, reorg, store, RPC, live loop, API, telemetry
+migrations/      PostgreSQL schema
+contracts/       local event emitter fixture
+scripts/         demo, benchmarks, and verification
+api/             OpenAPI contract
+docs/            design, failure cases, operations, and evidence
+```
 
-## License
+See the [implementation contract](SPEC.md), [ADRs](docs/adr/), [threat model](docs/threat-model.md), [observability guide](docs/observability.md), and [OpenAPI contract](api/openapi.yaml).
 
-ReorgGuard is licensed under the [Apache License 2.0](LICENSE).
+## Scope and trust
+
+RPC endpoints remain trusted observation sources. Multiple endpoints improve availability but cannot prove global chain truth or detect a plausible omission from `eth_getLogs`. Confirmation depth is a policy, not irreversible finality. The API defaults to loopback; public access needs a separate network and authentication design. Local provenance is unsigned, and the project has no production operating history or independent audit.
+
+Apache-2.0. See [LICENSE](LICENSE).
