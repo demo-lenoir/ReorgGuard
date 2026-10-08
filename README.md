@@ -38,8 +38,8 @@ The [failure matrix](docs/failure-matrix.md) and [architecture](docs/architectur
 Install Go 1.27.1, Docker, Foundry (`anvil`, `forge`, `cast`), Python 3, PostgreSQL command-line tools, `rg`, and `make`. The first run downloads public modules and local test tools. No private chain credentials are required.
 
 ```sh
-git clone <repository-url> FinalReorgGuard
-cd FinalReorgGuard
+git clone https://github.com/demo-lenoir/ReorgGuard.git ReorgGuard
+cd ReorgGuard
 go mod download
 make demo
 go test ./...
