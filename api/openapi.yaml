@@ -1,0 +1,195 @@
+openapi: 3.0.3
+info:
+  title: ReorgGuard operational API
+  version: 1.0.0
+  description: Read-only local operational API. No RPC URLs or credentials are returned.
+servers:
+  - url: http://127.0.0.1:8080
+paths:
+  /v1/status:
+    get:
+      operationId: getStatus
+      responses:
+        '200':
+          description: Current durable and transport status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Status'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /v1/logs:
+    get:
+      operationId: listLogs
+      description: Canonical logs ordered by block number, log index, then block hash. A cursor is valid only for the same filters and canonical revision; reorgs invalidate cursors.
+      parameters:
+        - name: from_block
+          in: query
+          schema: {type: integer, format: int64, minimum: 0}
+        - name: to_block
+          in: query
+          schema: {type: integer, format: int64, minimum: 0}
+        - name: address
+          in: query
+          schema: {type: string, pattern: '^0x[0-9a-fA-F]{40}$'}
+        - name: topic0
+          in: query
+          schema: {type: string, pattern: '^0x[0-9a-fA-F]{64}$'}
+        - name: limit
+          in: query
+          schema: {type: integer, minimum: 1, maximum: 100, default: 50}
+        - name: cursor
+          in: query
+          description: Opaque cursor returned by the previous page.
+          schema: {type: string, maxLength: 512}
+      responses:
+        '200':
+          description: Bounded canonical log page
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, canonical_revision]
+                properties:
+                  items:
+                    type: array
+                    maxItems: 100
+                    items: {$ref: '#/components/schemas/IndexedLog'}
+                  next_cursor: {type: string, nullable: true}
+                  canonical_revision: {type: integer, format: int64}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '413': {$ref: '#/components/responses/TooLarge'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /health/live:
+    get:
+      operationId: live
+      description: Process liveness independent of PostgreSQL and RPC health.
+      responses:
+        '200':
+          description: HTTP process is alive
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status: {type: string, enum: [live]}
+  /health/ready:
+    get:
+      operationId: ready
+      responses:
+        '200':
+          description: Safe canonical progress is possible within lag tolerance
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Readiness'}
+        '503':
+          description: Cannot safely progress or serve a fresh canonical view
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Readiness'}
+  /metrics:
+    get:
+      operationId: metrics
+      responses:
+        '200':
+          description: Prometheus text exposition with bounded labels
+          content:
+            text/plain:
+              schema: {type: string}
+components:
+  responses:
+    BadRequest:
+      description: Invalid filter or cursor
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    Conflict:
+      description: Canonical revision changed; restart pagination
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    Unavailable:
+      description: Durable state cannot be read
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    RateLimited:
+      description: Bounded request concurrency exceeded
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    TooLarge:
+      description: A selected log payload exceeds the operational 32 KiB per-record limit
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+  schemas:
+    Error:
+      type: object
+      required: [code, message, request_id]
+      properties:
+        code: {type: string, enum: [INVALID_ARGUMENT, CANONICAL_REVISION_CHANGED, DATABASE_UNAVAILABLE, RESULT_TOO_LARGE, RATE_LIMITED, INTERNAL]}
+        message: {type: string}
+        request_id: {type: string}
+    IndexedLog:
+      type: object
+      required: [block_number, block_hash, transaction_hash, transaction_index, log_index, address, topics, data]
+      properties:
+        block_number: {type: integer, format: int64}
+        block_hash: {type: string}
+        transaction_hash: {type: string}
+        transaction_index: {type: integer}
+        log_index: {type: integer}
+        address: {type: string}
+        topics: {type: array, items: {type: string}}
+        data: {type: string}
+    ReorgSummary:
+      type: object
+      required: [ancestor_height, ancestor_hash, old_head_height, old_head_hash, new_head_height, new_head_hash, depth, orphaned_blocks, orphaned_logs]
+      properties:
+        ancestor_height: {type: integer, format: int64}
+        ancestor_hash: {type: string}
+        old_head_height: {type: integer, format: int64}
+        old_head_hash: {type: string}
+        new_head_height: {type: integer, format: int64}
+        new_head_hash: {type: string}
+        depth: {type: integer, format: int64}
+        orphaned_blocks: {type: integer, format: int64}
+        orphaned_logs: {type: integer, format: int64}
+    Provider:
+      type: object
+      required: [name, state, head]
+      properties:
+        name: {type: string}
+        state: {type: string}
+        head: {type: integer, format: int64}
+    Status:
+      type: object
+      required: [chain_id, remote_head, indexed_head, lag_blocks, canonical_head_hash, checkpoint_age_seconds, active_rpc_endpoint, http_providers, websocket_state, sync_state, ready]
+      properties:
+        chain_id: {type: integer, format: int64}
+        remote_head: {type: integer, format: int64}
+        indexed_head: {type: integer, format: int64}
+        lag_blocks: {type: integer, format: int64}
+        canonical_head_hash: {type: string}
+        checkpoint_age_seconds: {type: number, minimum: 0}
+        last_reorg:
+          allOf:
+            - {$ref: '#/components/schemas/ReorgSummary'}
+          nullable: true
+        active_rpc_endpoint: {type: string}
+        http_providers: {type: array, items: {$ref: '#/components/schemas/Provider'}}
+        websocket_state: {type: string, enum: [connected, degraded, disabled]}
+        sync_state: {type: string}
+        ready: {type: boolean}
+        reason: {type: string}
+    Readiness:
+      type: object
+      required: [ready, state, reason]
+      properties:
+        ready: {type: boolean}
+        state: {type: string}
+        reason: {type: string}

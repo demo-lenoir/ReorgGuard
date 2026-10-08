@@ -1,0 +1,15 @@
+.git
+.github
+.env
+.env.*
+!.env.example
+out
+cache
+docs/evidence
+docs/benchmarks
+Инструкция.txt
+Портфолио.pdf
+*.test
+coverage.out
+bin
+tmp
