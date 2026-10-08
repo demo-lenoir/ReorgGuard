@@ -25,7 +25,7 @@ class BenchmarkArtifactMutationTest(unittest.TestCase):
             'cloned_repeats': lambda r: r['runs'].__setitem__(slice(-2, None), [copy.deepcopy(r['runs'][7]) for _ in range(2)]),
             'changed_source_commit': lambda r: r.update(source_commit='0' * 40),
             'changed_binary': lambda r: r.update(binary_sha256='0' * 64),
-            'changed_platform': lambda r: r.update(binary_target='linux/amd64'),
+            'changed_platform': lambda r: r.update(binary_target=('darwin/arm64' if r['binary_target'] != 'darwin/arm64' else 'linux/amd64')),
             'changed_checksum': lambda r: r['runs'][0].update(checksum='0' * 64),
             'changed_checkpoint': lambda r: r['runs'][0].update(checkpoint=1),
             'changed_dataset': lambda r: r['runs'][0].update(dataset_sha256='0' * 64),
@@ -37,6 +37,7 @@ class BenchmarkArtifactMutationTest(unittest.TestCase):
             with self.subTest(name=name):
                 raw = copy.deepcopy(self.raw)
                 mutate(raw)
+                self.assertNotEqual(raw, self.raw, 'mutation must change benchmark evidence')
                 with self.assertRaises(ValueError):
                     validator.validate_raw(raw)
 
